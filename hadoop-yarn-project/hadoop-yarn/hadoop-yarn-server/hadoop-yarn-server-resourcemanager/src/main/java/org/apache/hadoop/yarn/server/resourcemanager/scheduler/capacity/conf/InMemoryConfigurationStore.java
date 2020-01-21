@@ -32,21 +32,26 @@ import java.util.Map;
 public class InMemoryConfigurationStore extends YarnConfigurationStore {
 
   private Configuration schedConf;
-  private LogMutation pendingMutation;
+  private long configVersion;
 
   @Override
   public void initialize(Configuration conf, Configuration schedConf,
       RMContext rmContext) {
     this.schedConf = schedConf;
+    this.configVersion = 1L;
   }
 
+  /**
+   * This method does not log as it does not support backing store.
+   * The mutation to be applied on top of schedConf will be directly passed
+   * in confirmMutation.
+   */
   @Override
   public void logMutation(LogMutation logMutation) {
-    pendingMutation = logMutation;
   }
 
   @Override
-  public void confirmMutation(boolean isValid) {
+  public void confirmMutation(LogMutation pendingMutation, boolean isValid) {
     if (isValid) {
       for (Map.Entry<String, String> kv : pendingMutation.getUpdates()
           .entrySet()) {
@@ -56,13 +61,23 @@ public class InMemoryConfigurationStore extends YarnConfigurationStore {
           schedConf.set(kv.getKey(), kv.getValue());
         }
       }
+      this.configVersion = this.configVersion + 1L;
     }
-    pendingMutation = null;
+  }
+
+  @Override
+  public void format() {
+    this.schedConf = null;
   }
 
   @Override
   public synchronized Configuration retrieve() {
     return schedConf;
+  }
+
+  @Override
+  public long getConfigVersion() {
+    return configVersion;
   }
 
   @Override

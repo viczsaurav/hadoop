@@ -43,6 +43,15 @@ The implementations of `FileSystem` shipped with Apache Hadoop
 All the requirements of a valid FileSystem are considered implicit preconditions and postconditions:
 all operations on a valid FileSystem MUST result in a new FileSystem that is also valid.
 
+## Feasible features
+
+### <a name="ProtectedDirectories"></a>Protected directories
+
+HDFS has the notion of *Protected Directories*, which are declared in
+the option `fs.protected.directories`. Any attempt to delete or rename
+such a directory or a parent thereof raises an `AccessControlException`.
+Accordingly, any attempt to delete the root directory SHALL, if there is
+a protected directory, result in such an exception being raised.
 
 ## Predicates and other state access operations
 
@@ -526,7 +535,7 @@ on the filesystem.
    `getFileStatus(P).getBlockSize()`.
 1. By inference, it MUST be > 0 for any file of length > 0.
 
-## State Changing Operations
+## <a name="state_changing_operations"></a> State Changing Operations
 
 ### `boolean mkdirs(Path p, FsPermission permission)`
 
@@ -1009,12 +1018,6 @@ filesystem is desired.
 
 1. Object Stores: see [Object Stores: root directory deletion](#object-stores-rm-root).
 
-HDFS has the notion of *Protected Directories*, which are declared in
-the option `fs.protected.directories`. Any attempt to delete such a directory
-or a parent thereof raises an `AccessControlException`. Accordingly, any
-attempt to delete the root directory SHALL, if there is a protected directory,
-result in such an exception being raised.
-
 This specification does not recommend any specific action. Do note, however,
 that the POSIX model assumes that there is a permissions model such that normal
 users do not have the permission to delete that root directory; it is an action
@@ -1479,7 +1482,7 @@ public interface StreamCapabilities {
 
 ### `boolean hasCapability(capability)`
 
-Return true if the `OutputStream`, `InputStream`, or other FileSystem class
+Return true iff the `OutputStream`, `InputStream`, or other FileSystem class
 has the desired capability.
 
 The caller can query the capabilities of a stream using a string value.
@@ -1492,3 +1495,4 @@ hsync        | HSYNC      | Syncable         | Flush out the data in client's us
 in:readahead | READAHEAD  | CanSetReadahead  | Set the readahead on the input stream.
 dropbehind   | DROPBEHIND | CanSetDropBehind | Drop the cache.
 in:unbuffer  | UNBUFFER   | CanUnbuffer      | Reduce the buffering on the input stream.
+

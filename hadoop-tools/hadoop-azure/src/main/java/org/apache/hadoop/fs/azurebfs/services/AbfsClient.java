@@ -29,7 +29,7 @@ import java.util.List;
 import java.util.Locale;
 
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.hadoop.fs.azurebfs.utils.SSLSocketFactoryEx;
+import org.apache.hadoop.security.ssl.DelegatingSSLSocketFactory;
 import org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants;
 import org.apache.hadoop.fs.azurebfs.constants.HttpHeaderConfigurations;
 import org.apache.hadoop.fs.azurebfs.constants.HttpQueryParams;
@@ -60,6 +60,7 @@ public class AbfsClient implements Closeable {
   private final String filesystem;
   private final AbfsConfiguration abfsConfiguration;
   private final String userAgent;
+  private final AbfsPerfTracker abfsPerfTracker;
 
   private final AccessTokenProvider tokenProvider;
 
@@ -67,7 +68,8 @@ public class AbfsClient implements Closeable {
   public AbfsClient(final URL baseUrl, final SharedKeyCredentials sharedKeyCredentials,
                     final AbfsConfiguration abfsConfiguration,
                     final ExponentialRetryPolicy exponentialRetryPolicy,
-                    final AccessTokenProvider tokenProvider) {
+                    final AccessTokenProvider tokenProvider,
+                    final AbfsPerfTracker abfsPerfTracker) {
     this.baseUrl = baseUrl;
     this.sharedKeyCredentials = sharedKeyCredentials;
     String baseUrlString = baseUrl.toString();
@@ -79,15 +81,20 @@ public class AbfsClient implements Closeable {
 
     if (this.baseUrl.toString().startsWith(HTTPS_SCHEME)) {
       try {
-        SSLSocketFactoryEx.initializeDefaultFactory(this.abfsConfiguration.getPreferredSSLFactoryOption());
-        sslProviderName = SSLSocketFactoryEx.getDefaultFactory().getProviderName();
+        LOG.trace("Initializing DelegatingSSLSocketFactory with {} SSL "
+                + "Channel Mode", this.abfsConfiguration.getPreferredSSLFactoryOption());
+        DelegatingSSLSocketFactory.initializeDefaultFactory(this.abfsConfiguration.getPreferredSSLFactoryOption());
+        sslProviderName = DelegatingSSLSocketFactory.getDefaultFactory().getProviderName();
       } catch (IOException e) {
-        // Suppress exception. Failure to init SSLSocketFactoryEx would have only performance impact.
+        // Suppress exception. Failure to init DelegatingSSLSocketFactory would have only performance impact.
+        LOG.trace("NonCritFailure: DelegatingSSLSocketFactory Init failed : "
+            + "{}", e.getMessage());
       }
     }
 
     this.userAgent = initializeUserAgent(abfsConfiguration, sslProviderName);
     this.tokenProvider = tokenProvider;
+    this.abfsPerfTracker = abfsPerfTracker;
   }
 
   @Override
@@ -99,6 +106,10 @@ public class AbfsClient implements Closeable {
 
   public String getFileSystem() {
     return filesystem;
+  }
+
+  protected AbfsPerfTracker getAbfsPerfTracker() {
+    return abfsPerfTracker;
   }
 
   ExponentialRetryPolicy getRetryPolicy() {
@@ -513,6 +524,28 @@ public class AbfsClient implements Closeable {
         AbfsHttpConstants.HTTP_METHOD_HEAD,
         url,
         requestHeaders);
+    op.execute();
+    return op;
+  }
+
+  /**
+   * Talks to the server to check whether the permission specified in
+   * the rwx parameter is present for the path specified in the path parameter.
+   *
+   * @param path  Path for which access check needs to be performed
+   * @param rwx   The permission to be checked on the path
+   * @return      The {@link AbfsRestOperation} object for the operation
+   * @throws AzureBlobFileSystemException in case of bad requests
+   */
+  public AbfsRestOperation checkAccess(String path, String rwx)
+      throws AzureBlobFileSystemException {
+    AbfsUriQueryBuilder abfsUriQueryBuilder = createDefaultUriQueryBuilder();
+    abfsUriQueryBuilder.addQuery(QUERY_PARAM_ACTION, CHECK_ACCESS);
+    abfsUriQueryBuilder.addQuery(QUERY_FS_ACTION, rwx);
+    URL url = createRequestUrl(path, abfsUriQueryBuilder.toString());
+    AbfsRestOperation op = new AbfsRestOperation(
+        AbfsRestOperationType.CheckAccess, this,
+        AbfsHttpConstants.HTTP_METHOD_HEAD, url, createDefaultHeaders());
     op.execute();
     return op;
   }

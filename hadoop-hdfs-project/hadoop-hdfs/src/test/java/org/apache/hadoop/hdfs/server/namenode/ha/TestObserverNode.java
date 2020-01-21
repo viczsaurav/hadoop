@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hdfs.server.namenode.ha;
 
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_STATE_CONTEXT_ENABLED_KEY;
 import static org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter.getServiceState;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -51,6 +52,7 @@ import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
 import org.apache.hadoop.hdfs.server.namenode.NameNodeAdapter;
 import org.apache.hadoop.hdfs.server.namenode.TestFsck;
 import org.apache.hadoop.hdfs.tools.GetGroups;
+import org.apache.hadoop.ipc.ObserverRetryOnActiveException;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -77,6 +79,7 @@ public class TestObserverNode {
   @BeforeClass
   public static void startUpCluster() throws Exception {
     conf = new Configuration();
+    conf.setBoolean(DFS_NAMENODE_STATE_CONTEXT_ENABLED_KEY, true);
     qjmhaCluster = HATestUtil.setUpObserverCluster(conf, 1, 0, true);
     dfsCluster = qjmhaCluster.getDfsCluster();
   }
@@ -362,6 +365,52 @@ public class TestObserverNode {
     final String result = TestFsck.runFsck(conf, 0, true, "/");
     LOG.info("result=" + result);
     assertTrue(result.contains("Status: HEALTHY"));
+  }
+
+  /**
+   * Test that, if a write happens happens to go to Observer,
+   * Observer would throw {@link ObserverRetryOnActiveException},
+   * to inform client to retry on Active
+   *
+   * @throws Exception
+   */
+  @Test
+  public void testObserverRetryActiveException() throws Exception {
+    boolean thrownRetryException = false;
+    try {
+      // Force a write on Observer, which should throw
+      // retry on active exception.
+      dfsCluster.getNameNode(2)
+          .getRpcServer()
+          .mkdirs("/testActiveRetryException",
+              FsPermission.createImmutable((short) 0755), true);
+    } catch (ObserverRetryOnActiveException orae) {
+      thrownRetryException = true;
+    }
+    assertTrue(thrownRetryException);
+  }
+
+  /**
+   * Test that for open call, if access time update is required,
+   * the open call should go to active, instead of observer.
+   *
+   * @throws Exception
+   */
+  @Test
+  public void testAccessTimeUpdateRedirectToActive() throws Exception {
+    // Create a new pat to not mess up other tests
+    Path tmpTestPath = new Path("/TestObserverNodeAccessTime");
+    dfs.create(tmpTestPath, (short)1).close();
+    assertSentTo(0);
+    dfs.open(tmpTestPath).close();
+    assertSentTo(2);
+    // Set access time to a time in the far past.
+    // So that next read call is guaranteed to
+    // have passed access time period.
+    dfs.setTimes(tmpTestPath, 0, 0);
+    // Verify that aTime update redirects on Active
+    dfs.open(tmpTestPath).close();
+    assertSentTo(0);
   }
 
   private void assertSentTo(int nnIdx) throws IOException {

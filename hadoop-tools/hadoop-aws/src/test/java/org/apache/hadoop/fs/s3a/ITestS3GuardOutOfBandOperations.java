@@ -27,7 +27,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
-import org.apache.hadoop.test.LambdaTestUtils;
+import org.assertj.core.api.Assertions;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
@@ -49,18 +49,23 @@ import org.apache.hadoop.fs.s3a.s3guard.MetadataStore;
 import org.apache.hadoop.fs.s3a.s3guard.PathMetadata;
 import org.apache.hadoop.fs.s3a.s3guard.ITtlTimeProvider;
 import org.apache.hadoop.fs.contract.ContractTestUtils;
+import org.apache.hadoop.test.LambdaTestUtils;
 
 import static org.apache.hadoop.fs.contract.ContractTestUtils.readBytesToString;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.touch;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.writeTextFile;
-import static org.apache.hadoop.fs.s3a.Constants.CHANGE_DETECT_MODE;
-import static org.apache.hadoop.fs.s3a.Constants.CHANGE_DETECT_SOURCE;
+import static org.apache.hadoop.fs.s3a.Constants.AUTHORITATIVE_PATH;
 import static org.apache.hadoop.fs.s3a.Constants.DEFAULT_METADATASTORE_METADATA_TTL;
 import static org.apache.hadoop.fs.s3a.Constants.METADATASTORE_AUTHORITATIVE;
 import static org.apache.hadoop.fs.s3a.Constants.METADATASTORE_METADATA_TTL;
 import static org.apache.hadoop.fs.s3a.Constants.RETRY_INTERVAL;
 import static org.apache.hadoop.fs.s3a.Constants.RETRY_LIMIT;
 import static org.apache.hadoop.fs.s3a.Constants.S3_METADATA_STORE_IMPL;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.PROBE_INTERVAL_MILLIS;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.STABILIZATION_TIME;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.TIMESTAMP_SLEEP;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.awaitDeletedFileDisappearance;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.awaitFileStatus;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.checkListingContainsPath;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.checkListingDoesNotContainPath;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.metadataStorePersistsAuthoritativeBit;
@@ -114,12 +119,6 @@ import static org.mockito.Mockito.when;
  */
 @RunWith(Parameterized.class)
 public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
-
-  public static final int TIMESTAMP_SLEEP = 2000;
-
-  public static final int STABILIZATION_TIME = 20_000;
-
-  public static final int PROBE_INTERVAL_MILLIS = 2500;
 
   private S3AFileSystem guardedFs;
   private S3AFileSystem rawFS;
@@ -196,6 +195,7 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
     rawFS = createUnguardedFS();
     assertFalse("Raw FS still has S3Guard " + rawFS,
         rawFS.hasMetadataStore());
+    nameThread();
   }
 
   @Override
@@ -224,7 +224,8 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
 
     removeBaseAndBucketOverrides(uri.getHost(), config,
         METADATASTORE_AUTHORITATIVE,
-        METADATASTORE_METADATA_TTL);
+        METADATASTORE_METADATA_TTL,
+        AUTHORITATIVE_PATH);
     config.setBoolean(METADATASTORE_AUTHORITATIVE, authoritativeMode);
     config.setLong(METADATASTORE_METADATA_TTL,
         DEFAULT_METADATASTORE_METADATA_TTL);
@@ -247,7 +248,8 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
     removeBaseAndBucketOverrides(uri.getHost(), config,
         S3_METADATA_STORE_IMPL);
     removeBaseAndBucketOverrides(uri.getHost(), config,
-        METADATASTORE_AUTHORITATIVE);
+        METADATASTORE_AUTHORITATIVE,
+        AUTHORITATIVE_PATH);
     return createFS(uri, config);
   }
 
@@ -363,16 +365,25 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
           testTimeProvider.getNow(), testTimeProvider.getMetadataTtl());
 
       // READ GUARDED
-      String newRead = readBytesToString(guardedFs, testFilePath,
-          newText.length());
+      // This should fail in authoritative mode since we trust the metadatastore
+      // despite of the expiry. The metadata will not expire.
+      if (authoritative) {
+        intercept(FileNotFoundException.class, testFilePath.toString(),
+            "File should not be present in the metedatastore in authoritative mode.",
+            () -> readBytesToString(guardedFs, testFilePath, newText.length()));
+      } else {
+        String newRead = readBytesToString(guardedFs, testFilePath,
+            newText.length());
 
-      // CHECK LISTING - THE FILE SHOULD BE THERE, TOMBSTONE EXPIRED
-      checkListingContainsPath(guardedFs, testFilePath);
+        // CHECK LISTING - THE FILE SHOULD BE THERE, TOMBSTONE EXPIRED
+        checkListingContainsPath(guardedFs, testFilePath);
 
-      // we can assert that the originalText is the new one, which created raw
-      LOG.info("Old: {}, New: {}, Read: {}", originalText, newText, newRead);
-      assertEquals("The text should be modified with a new.", newText,
-          newRead);
+        // we can assert that the originalText is the new one, which created raw
+        LOG.info("Old: {}, New: {}, Read: {}", originalText, newText, newRead);
+        assertEquals("The text should be modified with a new.", newText,
+            newRead);
+      }
+
     } finally {
       guardedFs.delete(testFilePath, true);
       guardedFs.setTtlTimeProvider(originalTimeProvider);
@@ -446,8 +457,16 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
       // SET TIME SO METADATA EXPIRES
       when(mockTimeProvider.getNow()).thenReturn(110L);
 
-      // WRITE TO DELETED DIRECTORY - SUCCESS
-      createNonRecursive(guardedFs, filePath);
+      // WRITE TO DELETED DIRECTORY
+      // - FAIL ON AUTH = TRUE
+      // - SUCCESS ON AUTH = FALSE
+      if (authoritative) {
+        intercept(FileNotFoundException.class, filePath.getParent().toString(),
+            "Parent does not exist, so in authoritative mode this should fail.",
+            () -> createNonRecursive(guardedFs, filePath));
+      } else {
+        createNonRecursive(guardedFs, filePath);
+      }
 
     } finally {
       guardedFs.delete(filePath, true);
@@ -544,13 +563,24 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
       when(mockTimeProvider.getNow()).thenReturn(100L + 2 * ttl);
 
       // DELETE IN GUARDED FS
+      // NOTE: in auth this will be ineffective:
+      //  we already have the tombstone marker on the item, it won't expire,
+      //  so we don't delete the raw S3 file.
       guardedFs.delete(filePath, true);
 
       // FILE MUST NOT EXIST IN RAW
-      intercept(FileNotFoundException.class, filePath.toString(),
-          "This file should throw FNFE when reading through "
-              + "the raw fs, and the guarded fs deleted the file.",
-          () -> rawFS.getFileStatus(filePath));
+      // If authoritative, the file status can be retrieved raw:
+      //    deleting with guarded FS won't do anything because the tombstone
+      //    marker won't expire in auth mode.
+      // If not authoritative, we go to the S3 bucket and get an FNFE
+      if (authoritative) {
+        rawFS.getFileStatus(filePath);
+      } else {
+        intercept(FileNotFoundException.class, filePath.toString(),
+            "This file should throw FNFE when reading through "
+                + "the raw fs, and the guarded fs deleted the file.",
+            () -> rawFS.getFileStatus(filePath));
+      }
 
     } finally {
       guardedFs.delete(filePath, true);
@@ -590,8 +620,13 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
       checkListingDoesNotContainPath(guardedFs, testFile);
 
       // the tombstone is expired, so we should detect the file
+      // in non-authoritative mode
       when(mockTimeProvider.getNow()).thenReturn(100 + ttl);
-      checkListingContainsPath(guardedFs, testFile);
+      if (authoritative) {
+        checkListingDoesNotContainPath(guardedFs, testFile);
+      } else {
+        checkListingContainsPath(guardedFs, testFile);
+      }
     } finally {
       // cleanup
       guardedFs.delete(base, true);
@@ -722,7 +757,7 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
       assertArraySize("Added one file to the new dir, so the number of "
               + "files in the dir should be one.", 1, origList);
       S3AFileStatus origGuardedFileStatus = origList[0];
-      assertNotNull("No etag in origGuardedFileStatus" + origGuardedFileStatus,
+      assertNotNull("No etag in origGuardedFileStatus " + origGuardedFileStatus,
           origGuardedFileStatus.getETag());
       final DirListingMetadata dirListingMetadata =
           realMs.listChildren(guardedFs.qualify(testDirPath));
@@ -990,6 +1025,61 @@ public class ITestS3GuardOutOfBandOperations extends AbstractS3ATestBase {
     return (S3AFileStatus) eventually(
         STABILIZATION_TIME, PROBE_INTERVAL_MILLIS,
         () -> fs.getFileStatus(testFilePath));
+  }
+
+  @Test
+  public void testDeleteIgnoresTombstones() throws Throwable {
+    describe("Verify that directory delete goes behind tombstones");
+    Path dir = path("oobdir");
+    Path testFilePath = new Path(dir, "file");
+    // create a file under the store
+    createAndAwaitFs(guardedFs, testFilePath, "Original File is long");
+    // Delete the file leaving a tombstone in the metastore
+    LOG.info("Initial delete of guarded FS dir {}", dir);
+    guardedFs.delete(dir, true);
+//    deleteFile(guardedFs, testFilePath);
+    awaitDeletedFileDisappearance(guardedFs, testFilePath);
+    // add a new file in raw
+    createAndAwaitFs(rawFS, testFilePath, "hi!");
+    // now we need to be sure that the file appears in a listing
+    awaitListingContainsChild(rawFS, dir, testFilePath);
+
+    // now a hack to remove the empty dir up the tree
+    Path sibling = new Path(dir, "sibling");
+    guardedFs.mkdirs(sibling);
+    // now do a delete of the parent dir. This is required to also
+    // check the underlying fs.
+    LOG.info("Deleting guarded FS dir {} with OOB child", dir);
+    guardedFs.delete(dir, true);
+    LOG.info("Now waiting for child to be deleted in raw fs: {}", testFilePath);
+
+    // so eventually the file will go away.
+    // this is required to be true in auth as well as non-auth.
+
+    awaitDeletedFileDisappearance(rawFS, testFilePath);
+  }
+
+  /**
+   * Wait for a file to be visible.
+   * @param fs filesystem
+   * @param testFilePath path to query
+   * @throws Exception failure
+   */
+  private void awaitListingContainsChild(S3AFileSystem fs,
+      final Path dir,
+      final Path testFilePath)
+      throws Exception {
+    LOG.info("Awaiting list of {} to include {}", dir, testFilePath);
+    eventually(
+        STABILIZATION_TIME, PROBE_INTERVAL_MILLIS,
+        () -> {
+          FileStatus[] stats = fs.listStatus(dir);
+          Assertions.assertThat(stats)
+              .describedAs("listing of %s", dir)
+              .filteredOn(s -> s.getPath().equals(testFilePath))
+              .isNotEmpty();
+          return null;
+        });
   }
 
   private FSDataOutputStream createNonRecursive(FileSystem fs, Path path)

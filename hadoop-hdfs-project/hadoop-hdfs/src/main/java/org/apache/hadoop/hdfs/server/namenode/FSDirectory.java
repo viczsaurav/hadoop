@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
 import org.apache.hadoop.util.StringUtils;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -245,6 +246,10 @@ public class FSDirectory implements Closeable {
 
   public int getWriteHoldCount() {
     return this.dirLock.getWriteHoldCount();
+  }
+
+  public int getListLimit() {
+    return lsLimit;
   }
 
   @VisibleForTesting
@@ -498,7 +503,7 @@ public class FSDirectory implements Closeable {
         normalizePaths(protectedDirs, FS_PROTECTED_DIRECTORIES));
   }
 
-  SortedSet<String> getProtectedDirectories() {
+  public SortedSet<String> getProtectedDirectories() {
     return protectedDirectories;
   }
 
@@ -719,7 +724,7 @@ public class FSDirectory implements Closeable {
   /**
    * @return true if the path is a non-empty directory; otherwise, return false.
    */
-  boolean isNonEmptyDirectory(INodesInPath inodesInPath) {
+  public boolean isNonEmptyDirectory(INodesInPath inodesInPath) {
     readLock();
     try {
       final INode inode = inodesInPath.getLastINode();
@@ -1296,7 +1301,9 @@ public class FSDirectory implements Closeable {
     // always verify inode name
     verifyINodeName(inode.getLocalNameBytes());
 
-    final QuotaCounts counts = inode.computeQuotaUsage(getBlockStoragePolicySuite());
+    final QuotaCounts counts = inode
+        .computeQuotaUsage(getBlockStoragePolicySuite(),
+            parent.getStoragePolicyID(), false, Snapshot.CURRENT_STATE_ID);
     updateCount(existing, pos, counts, checkQuota);
 
     boolean isRename = (inode.getParent() != null);

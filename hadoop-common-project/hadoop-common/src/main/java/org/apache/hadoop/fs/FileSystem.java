@@ -63,6 +63,7 @@ import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsCreateModes;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.MultipleIOException;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.AccessControlException;
@@ -88,6 +89,7 @@ import org.slf4j.LoggerFactory;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.*;
+import static org.apache.hadoop.fs.impl.PathCapabilitiesSupport.validatePathCapabilityArgs;
 
 /****************************************************************
  * An abstract base class for a fairly generic filesystem.  It
@@ -134,7 +136,7 @@ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.*;
 @InterfaceAudience.Public
 @InterfaceStability.Stable
 public abstract class FileSystem extends Configured
-    implements Closeable, DelegationTokenIssuer {
+    implements Closeable, DelegationTokenIssuer, PathCapabilities {
   public static final String FS_DEFAULT_NAME_KEY =
                    CommonConfigurationKeys.FS_DEFAULT_NAME_KEY;
   public static final String DEFAULT_FS =
@@ -210,6 +212,11 @@ public abstract class FileSystem extends Configured
   static void removeFileSystemForTesting(URI uri, Configuration conf,
       FileSystem fs) throws IOException {
     CACHE.map.remove(new Cache.Key(uri, conf), fs);
+  }
+
+  @VisibleForTesting
+  static int cacheSize() {
+    return CACHE.map.size();
   }
 
   /**
@@ -715,6 +722,7 @@ public abstract class FileSystem extends Configured
    *
    */
   protected void checkPath(Path path) {
+    Preconditions.checkArgument(path != null, "null path");
     URI uri = path.toUri();
     String thatScheme = uri.getScheme();
     if (thatScheme == null)                // fs is relative
@@ -1789,6 +1797,33 @@ public abstract class FileSystem extends Configured
   }
 
   /**
+   * Set quota for the given {@link Path}.
+   *
+   * @param src the target path to set quota for
+   * @param namespaceQuota the namespace quota (i.e., # of files/directories)
+   *                       to set
+   * @param storagespaceQuota the storage space quota to set
+   * @throws IOException IO failure
+   */
+  public void setQuota(Path src, final long namespaceQuota,
+      final long storagespaceQuota) throws IOException {
+    methodNotSupported();
+  }
+
+  /**
+   * Set per storage type quota for the given {@link Path}.
+   *
+   * @param src the target path to set storage type quota for
+   * @param type the storage type to set
+   * @param quota the quota to set for the given storage type
+   * @throws IOException IO failure
+   */
+  public void setQuotaByStorageType(Path src, final StorageType type,
+      final long quota) throws IOException {
+    methodNotSupported();
+  }
+
+  /**
    * The default filter accepts all paths.
    */
   private static final PathFilter DEFAULT_FILTER = new PathFilter() {
@@ -2030,7 +2065,12 @@ public abstract class FileSystem extends Configured
    * @throws IOException IO failure
    */
   public FileStatus[] globStatus(Path pathPattern) throws IOException {
-    return new Globber(this, pathPattern, DEFAULT_FILTER).glob();
+    return Globber.createGlobber(this)
+        .withPathPattern(pathPattern)
+        .withPathFiltern(DEFAULT_FILTER)
+        .withResolveSymlinks(true)
+        .build()
+        .glob();
   }
 
   /**
@@ -2120,24 +2160,19 @@ public abstract class FileSystem extends Configured
     private DirectoryEntries entries;
     private int i = 0;
 
-    DirListingIterator(Path path) {
+    DirListingIterator(Path path) throws IOException {
       this.path = path;
+      this.entries = listStatusBatch(path, null);
     }
 
     @Override
     public boolean hasNext() throws IOException {
-      if (entries == null) {
-        fetchMore();
-      }
       return i < entries.getEntries().length ||
           entries.hasMore();
     }
 
     private void fetchMore() throws IOException {
-      byte[] token = null;
-      if (entries != null) {
-        token = entries.getToken();
-      }
+      byte[] token = entries.getToken();
       entries = listStatusBatch(path, token);
       i = 0;
     }
@@ -2170,6 +2205,33 @@ public abstract class FileSystem extends Configured
   public RemoteIterator<FileStatus> listStatusIterator(final Path p)
   throws FileNotFoundException, IOException {
     return new DirListingIterator<>(p);
+  }
+
+  /**
+   * Batched listing API that returns {@link PartialListing}s for the
+   * passed Paths.
+   *
+   * @param paths List of paths to list.
+   * @return RemoteIterator that returns corresponding PartialListings.
+   * @throws IOException
+   */
+  public RemoteIterator<PartialListing<FileStatus>> batchedListStatusIterator(
+      final List<Path> paths) throws IOException {
+    throw new UnsupportedOperationException("Not implemented");
+  }
+
+  /**
+   * Batched listing API that returns {@link PartialListing}s for the passed
+   * Paths. The PartialListing will contain {@link LocatedFileStatus} entries
+   * with locations.
+   *
+   * @param paths List of paths to list.
+   * @return RemoteIterator that returns corresponding PartialListings.
+   * @throws IOException
+   */
+  public RemoteIterator<PartialListing<LocatedFileStatus>> batchedListLocatedStatusIterator(
+      final List<Path> paths) throws IOException {
+    throw new UnsupportedOperationException("Not implemented");
   }
 
   /**
@@ -3227,6 +3289,25 @@ public abstract class FileSystem extends Configured
     return ret;
   }
 
+  /**
+   * The base FileSystem implementation generally has no knowledge
+   * of the capabilities of actual implementations.
+   * Unless it has a way to explicitly determine the capabilities,
+   * this method returns false.
+   * {@inheritDoc}
+   */
+  public boolean hasPathCapability(final Path path, final String capability)
+      throws IOException {
+    switch (validatePathCapabilityArgs(makeQualified(path), capability)) {
+    case CommonPathCapabilities.FS_SYMLINKS:
+      // delegate to the existing supportsSymlinks() call.
+      return supportsSymlinks() && areSymlinksEnabled();
+    default:
+      // the feature is not implemented.
+      return false;
+    }
+  }
+
   // making it volatile to be able to do a double checked locking
   private volatile static boolean FILE_SYSTEMS_LOADED = false;
 
@@ -3333,9 +3414,22 @@ public abstract class FileSystem extends Configured
     Tracer tracer = FsTracer.get(conf);
     try(TraceScope scope = tracer.newScope("FileSystem#createFileSystem")) {
       scope.addKVAnnotation("scheme", uri.getScheme());
-      Class<?> clazz = getFileSystemClass(uri.getScheme(), conf);
-      FileSystem fs = (FileSystem)ReflectionUtils.newInstance(clazz, conf);
-      fs.initialize(uri, conf);
+      Class<? extends FileSystem> clazz =
+          getFileSystemClass(uri.getScheme(), conf);
+      FileSystem fs = ReflectionUtils.newInstance(clazz, conf);
+      try {
+        fs.initialize(uri, conf);
+      } catch (IOException | RuntimeException e) {
+        // exception raised during initialization.
+        // log summary at warn and full stack at debug
+        LOGGER.warn("Failed to initialize fileystem {}: {}",
+            uri, e.toString());
+        LOGGER.debug("Failed to initialize fileystem", e);
+        // then (robustly) close the FS, so as to invoke any
+        // cleanup code.
+        IOUtils.cleanupWithLogger(LOGGER, fs);
+        throw e;
+      }
       return fs;
     }
   }
@@ -4453,6 +4547,22 @@ public abstract class FileSystem extends Configured
       result.completeExceptionally(tx);
     }
     return result;
+  }
+
+  /**
+   * Helper method that throws an {@link UnsupportedOperationException} for the
+   * current {@link FileSystem} method being called.
+   */
+  private void methodNotSupported() {
+    // The order of the stacktrace elements is (from top to bottom):
+    //   - java.lang.Thread.getStackTrace
+    //   - org.apache.hadoop.fs.FileSystem.methodNotSupported
+    //   - <the FileSystem method>
+    // therefore, to find out the current method name, we use the element at
+    // index 2.
+    String name = Thread.currentThread().getStackTrace()[2].getMethodName();
+    throw new UnsupportedOperationException(getClass().getCanonicalName() +
+        " does not support method " + name);
   }
 
   /**

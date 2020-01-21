@@ -79,6 +79,7 @@ import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.fs.StorageStatistics.LongStatistic;
 import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.fs.contract.ContractTestUtils;
+import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DistributedFileSystem.HdfsDataOutputStreamBuilder;
 import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
@@ -90,10 +91,13 @@ import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
 import org.apache.hadoop.hdfs.protocol.CachePoolInfo;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.RollingUpgradeAction;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.StoragePolicySatisfierMode;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.OpenFileEntry;
+import org.apache.hadoop.hdfs.protocol.OpenFilesIterator;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi;
@@ -194,8 +198,10 @@ public class TestDistributedFileSystem {
    * Tests DFSClient.close throws no ConcurrentModificationException if 
    * multiple files are open.
    * Also tests that any cached sockets are closed. (HDFS-3359)
+   * Also tests deprecated listOpenFiles(EnumSet<>). (HDFS-14595)
    */
   @Test
+  @SuppressWarnings("deprecation") // call to listOpenFiles(EnumSet<>)
   public void testDFSClose() throws Exception {
     Configuration conf = getTestConfiguration();
     MiniDFSCluster cluster = null;
@@ -206,6 +212,19 @@ public class TestDistributedFileSystem {
       // create two files, leaving them open
       fileSys.create(new Path("/test/dfsclose/file-0"));
       fileSys.create(new Path("/test/dfsclose/file-1"));
+
+      // Test listOpenFiles(EnumSet<>)
+      List<OpenFilesIterator.OpenFilesType> types = new ArrayList<>();
+      types.add(OpenFilesIterator.OpenFilesType.ALL_OPEN_FILES);
+      RemoteIterator<OpenFileEntry> listOpenFiles =
+          fileSys.listOpenFiles(EnumSet.copyOf(types));
+      assertTrue("Two files should be open", listOpenFiles.hasNext());
+      int countOpenFiles = 0;
+      while (listOpenFiles.hasNext()) {
+        listOpenFiles.next();
+        ++countOpenFiles;
+      }
+      assertEquals("Mismatch of open files count", 2, countOpenFiles);
 
       // create another file, close it, and read it, so
       // the client gets a socket in its SocketCache
@@ -1859,6 +1878,34 @@ public class TestDistributedFileSystem {
               return null;
             }
           }));
+    }
+  }
+
+  @Test
+  public void testListingStoragePolicyNonSuperUser() throws Exception {
+    HdfsConfiguration conf = new HdfsConfiguration();
+    try (MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build()) {
+      cluster.waitActive();
+      final DistributedFileSystem dfs = cluster.getFileSystem();
+      Path dir = new Path("/dir");
+      dfs.mkdirs(dir);
+      dfs.setPermission(dir,
+          new FsPermission(FsAction.ALL, FsAction.ALL, FsAction.ALL));
+
+      // Create a non-super user.
+      UserGroupInformation user = UserGroupInformation.createUserForTesting(
+          "Non_SuperUser", new String[] {"Non_SuperGroup"});
+
+      DistributedFileSystem userfs = (DistributedFileSystem) user.doAs(
+          (PrivilegedExceptionAction<FileSystem>) () -> FileSystem.get(conf));
+      Path sDir = new Path("/dir/sPolicy");
+      userfs.mkdirs(sDir);
+      userfs.setStoragePolicy(sDir, "COLD");
+      HdfsFileStatus[] list = userfs.getClient()
+          .listPaths(dir.toString(), HdfsFileStatus.EMPTY_NAME)
+          .getPartialListing();
+      assertEquals(HdfsConstants.COLD_STORAGE_POLICY_ID,
+          list[0].getStoragePolicy());
     }
   }
 

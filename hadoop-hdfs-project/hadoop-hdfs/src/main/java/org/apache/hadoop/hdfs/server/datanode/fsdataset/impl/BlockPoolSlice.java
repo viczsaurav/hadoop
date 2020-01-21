@@ -69,6 +69,7 @@ import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.MultipleIOException;
 import org.apache.hadoop.util.AutoCloseableLock;
 import org.apache.hadoop.util.DataChecksum;
+import org.apache.hadoop.util.DataChecksum.Type;
 import org.apache.hadoop.util.DiskChecker;
 import org.apache.hadoop.util.DiskChecker.DiskErrorException;
 import org.apache.hadoop.util.ShutdownHookManager;
@@ -191,7 +192,7 @@ class BlockPoolSlice {
 
     if (addReplicaThreadPool == null) {
       // initialize add replica fork join pool
-      initializeAddReplicaPool(conf);
+      initializeAddReplicaPool(conf, (FsDatasetImpl) volume.getDataset());
     }
     // Make the dfs usage to be saved during shutdown.
     shutdownHook = new Runnable() {
@@ -207,9 +208,9 @@ class BlockPoolSlice {
         SHUTDOWN_HOOK_PRIORITY);
   }
 
-  private synchronized void initializeAddReplicaPool(Configuration conf) {
+  private synchronized static void initializeAddReplicaPool(Configuration conf,
+      FsDatasetImpl dataset) {
     if (addReplicaThreadPool == null) {
-      FsDatasetImpl dataset = (FsDatasetImpl) volume.getDataset();
       int numberOfBlockPoolSlice = dataset.getVolumeCount()
           * dataset.getBPServiceCount();
       int poolsize = Math.max(numberOfBlockPoolSlice,
@@ -802,6 +803,10 @@ class BlockPoolSlice {
         // read and handle the common header here. For now just a version
         final DataChecksum checksum = BlockMetadataHeader.readDataChecksum(
             checksumIn, metaFile);
+        if (Type.NULL.equals(checksum.getChecksumType())) {
+          // in case of NULL checksum type consider full file as valid
+          return blockFileLen;
+        }
         int bytesPerChecksum = checksum.getBytesPerChecksum();
         int checksumSize = checksum.getChecksumSize();
         long numChunks = Math.min(
@@ -1044,5 +1049,16 @@ class BlockPoolSlice {
   @VisibleForTesting
   public static int getAddReplicaForkPoolSize() {
     return addReplicaThreadPool.getPoolSize();
+  }
+
+  @VisibleForTesting
+  public ForkJoinPool getAddReplicaThreadPool() {
+    return addReplicaThreadPool;
+  }
+
+  @VisibleForTesting
+  public static void reInitializeAddReplicaThreadPool() {
+    addReplicaThreadPool.shutdown();
+    addReplicaThreadPool = null;
   }
 }

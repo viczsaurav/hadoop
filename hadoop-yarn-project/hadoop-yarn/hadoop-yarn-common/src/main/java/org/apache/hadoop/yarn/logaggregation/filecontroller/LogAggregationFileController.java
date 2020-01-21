@@ -52,7 +52,6 @@ import org.apache.hadoop.yarn.api.records.ApplicationAccessType;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
-import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.logaggregation.LogAggregationUtils;
 import org.apache.hadoop.yarn.webapp.View.ViewContext;
@@ -99,11 +98,6 @@ public abstract class LogAggregationFileController {
    */
   protected static final FsPermission APP_LOG_FILE_UMASK = FsPermission
       .createImmutable((short) (0640 ^ 0777));
-
-  // This is temporary solution. The configuration will be deleted once we have
-  // the FileSystem API to check whether append operation is supported or not.
-  public static final String LOG_AGGREGATION_FS_SUPPORT_APPEND
-      = YarnConfiguration.YARN_PREFIX+ "log-aggregation.fs-support-append";
 
   protected Configuration conf;
   protected Path remoteRootLogDir;
@@ -346,13 +340,23 @@ public abstract class LogAggregationFileController {
         }
 
         UserGroupInformation loginUser = UserGroupInformation.getLoginUser();
-        String primaryGroupName = null;
-        try {
-          primaryGroupName = loginUser.getPrimaryGroupName();
-        } catch (IOException e) {
-          LOG.warn("No primary group found. The remote root log directory" +
-              " will be created with the HDFS superuser being its group " +
-              "owner. JobHistoryServer may be unable to read the directory.");
+        String primaryGroupName = conf.get(
+            YarnConfiguration.NM_REMOTE_APP_LOG_DIR_GROUPNAME);
+        if (primaryGroupName == null || primaryGroupName.isEmpty()) {
+          try {
+            primaryGroupName = loginUser.getPrimaryGroupName();
+          } catch (IOException e) {
+            LOG.warn("No primary group found. The remote root log directory" +
+                    " will be created with the HDFS superuser being its " +
+                    "group owner. JobHistoryServer may be unable to read " +
+                    "the directory.");
+          }
+        } else {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("The group of remote root log directory has been " +
+                "determined by the configuration and set to " +
+                primaryGroupName);
+          }
         }
         // set owner on the remote directory only if the primary group exists
         if (primaryGroupName != null) {

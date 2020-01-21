@@ -1564,6 +1564,7 @@ Multiple parameters can be specified for GET operations. The started and finishe
       * finishedTimeEnd - applications with finish time ending with this time, specified in ms since epoch
       * applicationTypes - applications matching the given application types, specified as a comma-separated list.
       * applicationTags - applications matching any of the given application tags, specified as a comma-separated list.
+      * name - name of the application
       * deSelects - a generic fields which will be skipped in the result.
 
 ### Elements of the *apps* (Applications) object
@@ -5291,6 +5292,87 @@ Response Header:
       HTTP/1.1 200 OK
       Content-Type: application/xml
       Transfer-Encoding: chunked
+
+**Adding Node Labels to a queue**
+
+Assuming we are using the capacity scheduler and the current queue configuration is two queues root.default, and root.a, this example adds a Node Label x to the queue root.a. Create a Node Label x and assign the nodes with below commands.
+
+```yarn rmadmin -addToClusterNodeLabels "x(exclusive=true)"```
+
+```yarn rmadmin -replaceLabelsOnNode "<nodeId>=x"```
+
+HTTP Request:
+
+```xml
+      Accept: application/xml
+      PUT http://rm-http-address:port/ws/v1/cluster/scheduler-conf
+      Content-Type: application/xml
+      <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+      <sched-conf>
+        <update-queue>
+          <queue-name>root.a</queue-name>
+          <params>
+            <entry>
+              <key>accessible-node-labels</key>
+              <value>x</value>
+            </entry>
+            <entry>
+              <key>accessible-node-labels.x.capacity</key>
+              <value>100</value>
+            </entry>
+          </params>
+        </update-queue>
+        <update-queue>
+          <queue-name>root</queue-name>
+          <params>
+            <entry>
+              <key>accessible-node-labels.x.capacity</key>
+              <value>100</value>
+            </entry>
+          </params>
+        </update-queue>
+      </sched-conf>
+```
+
+
+Response Header:
+
+      HTTP/1.1 200 OK
+      Content-Type: application/xml
+      Transfer-Encoding: chunked
+
+**Removing Node Labels from a queue**
+
+Assuming we are using the capacity scheduler and the current queue configuration is two queues root.default, and root.a and Node Label x is assigned to queue root.a. This example unsets the Node Label x from the queue root.a and removes it.
+
+HTTP Request:
+
+```xml
+      Accept: application/xml
+      PUT http://rm-http-address:port/ws/v1/cluster/scheduler-conf
+      Content-Type: application/xml
+      <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+      <sched-conf>
+        <update-queue>
+          <queue-name>root.a</queue-name>
+          <params>
+            <entry>
+              <key>accessible-node-labels</key>
+              <value></value>
+            </entry>
+          </params>
+        </update-queue>
+      </sched-conf>
+```
+
+
+Response Header:
+
+      HTTP/1.1 200 OK
+      Content-Type: application/xml
+      Transfer-Encoding: chunked
+
+```yarn rmadmin -removeFromClusterNodeLabels x```
 
 
 Cluster Container Signal API

@@ -27,6 +27,8 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIFELINE_HANDLER
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SERVICE_HANDLER_COUNT_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SERVICE_HANDLER_COUNT_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RPC_ADDRESS_AUXILIARY_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_STATE_CONTEXT_ENABLED_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_STATE_CONTEXT_ENABLED_KEY;
 import static org.apache.hadoop.hdfs.server.common.HdfsServerConstants.MAX_PATH_DEPTH;
 import static org.apache.hadoop.hdfs.server.common.HdfsServerConstants.MAX_PATH_LENGTH;
 import static org.apache.hadoop.util.Time.now;
@@ -87,6 +89,7 @@ import org.apache.hadoop.hdfs.inotify.EventBatchList;
 import org.apache.hadoop.hdfs.protocol.AclException;
 import org.apache.hadoop.hdfs.protocol.AddErasureCodingPolicyResponse;
 import org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException;
+import org.apache.hadoop.hdfs.protocol.BatchedDirectoryListing;
 import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.protocol.CacheDirectiveEntry;
@@ -105,6 +108,7 @@ import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicyInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.FSLimitException;
 import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
+import org.apache.hadoop.hdfs.protocol.HdfsPartialListing;
 import org.apache.hadoop.hdfs.protocol.LastBlockWithStatus;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.ReencryptAction;
@@ -447,6 +451,16 @@ public class NameNodeRpcServer implements NamenodeProtocols {
     }
     LOG.info("RPC server is binding to " + bindHost + ":" + rpcAddr.getPort());
 
+    boolean enableStateContext = conf.getBoolean(
+        DFS_NAMENODE_STATE_CONTEXT_ENABLED_KEY,
+        DFS_NAMENODE_STATE_CONTEXT_ENABLED_DEFAULT);
+    LOG.info("Enable NameNode state context:" + enableStateContext);
+
+    GlobalStateIdContext stateIdContext = null;
+    if (enableStateContext) {
+      stateIdContext = new GlobalStateIdContext((namesystem));
+    }
+
     clientRpcServer = new RPC.Builder(conf)
         .setProtocol(
             org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolPB.class)
@@ -456,7 +470,7 @@ public class NameNodeRpcServer implements NamenodeProtocols {
         .setNumHandlers(handlerCount)
         .setVerbose(false)
         .setSecretManager(namesystem.getDelegationTokenSecretManager())
-        .setAlignmentContext(new GlobalStateIdContext(namesystem))
+        .setAlignmentContext(stateIdContext)
         .build();
 
     // Add all the RPC protocols that the namenode implements
@@ -1168,6 +1182,27 @@ public class NameNodeRpcServer implements NamenodeProtocols {
   }
 
   @Override // ClientProtocol
+  public BatchedDirectoryListing getBatchedListing(
+      String[] srcs,
+      byte[] startAfter,
+      boolean needLocation) throws IOException {
+    checkNNStartup();
+    BatchedDirectoryListing batchedListing =
+        namesystem.getBatchedListing(srcs, startAfter, needLocation);
+    if (batchedListing != null) {
+      metrics.incrGetListingOps();
+      int numEntries = 0;
+      for (HdfsPartialListing partial : batchedListing.getListings()) {
+        if (partial.getPartialListing() != null) {
+          numEntries += partial.getPartialListing().size();
+        }
+      }
+      metrics.incrFilesInGetListingOps(numEntries);
+    }
+    return batchedListing;
+  }
+
+  @Override // ClientProtocol
   public HdfsFileStatus getFileInfo(String src) throws IOException {
     checkNNStartup();
     metrics.incrFileInfoOps();
@@ -1419,6 +1454,12 @@ public class NameNodeRpcServer implements NamenodeProtocols {
    */
   @Override // ClientProtocol
   public void setBalancerBandwidth(long bandwidth) throws IOException {
+    if (bandwidth > HdfsServerConstants.MAX_BANDWIDTH_PER_DATANODE) {
+      throw new IllegalArgumentException(
+          "Bandwidth should not exceed maximum limit "
+              + HdfsServerConstants.MAX_BANDWIDTH_PER_DATANODE
+              + " bytes per second");
+    }
     checkNNStartup();
     namesystem.setBalancerBandwidth(bandwidth);
   }
@@ -1775,11 +1816,22 @@ public class NameNodeRpcServer implements NamenodeProtocols {
     nn.checkHaStateChange(req);
     nn.transitionToActive();
   }
-  
+
   @Override // HAServiceProtocol
-  public synchronized void transitionToStandby(StateChangeRequestInfo req) 
+  public synchronized void transitionToStandby(StateChangeRequestInfo req)
       throws ServiceFailedException, AccessControlException, IOException {
     checkNNStartup();
+    // This is to eliminate any race condition between manual transition of
+    // namenode into Observer, and ZKFC auto failover election, when the
+    // namenode has already participated in the
+    // ZKFC election, before transition to Observer state as Standby Node.
+    // For more details check : HDFS-14961.
+    if (nn.getState().equals(NameNode.OBSERVER_STATE.toString())
+        && req.getSource() == RequestSource.REQUEST_BY_ZKFC) {
+      throw new AccessControlException(
+          "Request from ZK failover controller at " + Server.getRemoteAddress()
+              + " denied since the namenode is in Observer state.");
+    }
     nn.checkHaStateChange(req);
     nn.transitionToStandby();
   }
